@@ -1,11 +1,14 @@
 package cache
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/restic/restic/internal/backend"
@@ -88,6 +91,37 @@ func (c *Cache) save(h backend.Handle, rd io.Reader) error {
 		return errors.New("cannot be cached")
 	}
 
+	// If we have a size limit, create a buffer to check the file size
+	var buf *bytes.Buffer
+	var fileReader io.Reader = rd
+
+	if c.maxSize > 0 {
+		// We'll use this buffer to hold the file temporarily while we check the size
+		buf = &bytes.Buffer{}
+
+		// Read the entire file into the buffer first
+		if _, err := io.Copy(buf, rd); err != nil {
+			return errors.Wrap(err, "reading file into buffer")
+		}
+
+		// Check if adding this file would exceed the limit
+		totalSize, err := c.getTotalSize()
+		if err != nil {
+			return errors.Wrap(err, "getTotalSize")
+		}
+
+		if totalSize+int64(buf.Len()) > c.maxSize {
+			// Need to clean up old files
+			if err := c.enforceSizeLimit(); err != nil {
+				debug.Log("error enforcing size limit: %v", err)
+				// Continue anyway - we still want to try to save the file
+			}
+		}
+
+		// Use the buffer as the reader for saving
+		fileReader = bytes.NewReader(buf.Bytes())
+	}
+
 	finalname := c.filename(h)
 	dir := filepath.Dir(finalname)
 	err := os.Mkdir(dir, 0700)
@@ -102,7 +136,7 @@ func (c *Cache) save(h backend.Handle, rd io.Reader) error {
 		return err
 	}
 
-	n, err := io.Copy(f, rd)
+	n, err := io.Copy(f, fileReader)
 	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(f.Name())
@@ -137,6 +171,124 @@ func (c *Cache) save(h backend.Handle, rd io.Reader) error {
 	}
 
 	return errors.WithStack(err)
+}
+
+// enforceSizeLimit checks if the cache size is over the limit and removes
+// the oldest files until the cache is under the limit.
+func (c *Cache) enforceSizeLimit() error {
+	// If no max size set, nothing to do
+	if c.maxSize <= 0 {
+		return nil
+	}
+
+	totalSize, err := c.getTotalSize()
+	if err != nil {
+		return errors.Wrap(err, "getTotalSize")
+	}
+
+	// If we're under the limit, nothing to do
+	if totalSize <= c.maxSize {
+		return nil
+	}
+
+	debug.Log("cache size %d exceeds limit %d, cleaning up", totalSize, c.maxSize)
+
+	// Target 80% of the max size to avoid frequent cleanups
+	targetSize := c.maxSize * 80 / 100
+
+	// Get all cache files with their timestamps and sizes
+	type fileEntry struct {
+		path    string
+		modTime time.Time
+		size    int64
+	}
+
+	var files []fileEntry
+
+	// Walk through all cache types
+	for ftype, cachePath := range cacheLayoutPaths {
+		typePath := filepath.Join(c.path, cachePath)
+
+		err := filepath.Walk(typePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+
+			if info.IsDir() {
+				return nil
+			}
+
+			files = append(files, fileEntry{
+				path:    path,
+				modTime: info.ModTime(),
+				size:    info.Size(),
+			})
+
+			return nil
+		})
+
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.Wrap(err, fmt.Sprintf("walking cache dir for type %v", ftype))
+		}
+	}
+
+	// Sort files by modification time (oldest first)
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].modTime.Before(files[j].modTime)
+	})
+
+	// Remove files until we're under the target size
+	for _, file := range files {
+		if totalSize <= targetSize {
+			break
+		}
+
+		debug.Log("removing cached file %v (size %d)", file.path, file.size)
+
+		err := os.Remove(file.path)
+		if err != nil {
+			debug.Log("error removing cache file %v: %v", file.path, err)
+			// Don't stop, try to remove more files
+			continue
+		}
+
+		totalSize -= file.size
+	}
+
+	return nil
+}
+
+// getTotalSize returns the total size of all files in the cache.
+func (c *Cache) getTotalSize() (int64, error) {
+	var totalSize int64
+
+	for _, cachePath := range cacheLayoutPaths {
+		typePath := filepath.Join(c.path, cachePath)
+
+		err := filepath.Walk(typePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+
+			if !info.IsDir() {
+				totalSize += info.Size()
+			}
+
+			return nil
+		})
+
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, errors.Wrap(err, "walking cache dir")
+		}
+	}
+
+	return totalSize, nil
 }
 
 func (c *Cache) Forget(h backend.Handle) error {

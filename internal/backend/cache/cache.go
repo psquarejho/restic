@@ -20,6 +20,7 @@ type Cache struct {
 	path    string
 	Base    string
 	Created bool
+	maxSize int64
 
 	forgotten sync.Map
 }
@@ -76,7 +77,7 @@ func writeCachedirTag(dir string) error {
 //
 // For partial files, the complete file is loaded and stored in the cache when
 // performReadahead returns true.
-func New(id string, basedir string) (c *Cache, err error) {
+func New(id string, basedir string, maxSize int64) (c *Cache, err error) {
 	if basedir == "" {
 		basedir, err = DefaultDir()
 		if err != nil {
@@ -142,6 +143,7 @@ func New(id string, basedir string) (c *Cache, err error) {
 		path:    cachedir,
 		Base:    basedir,
 		Created: created,
+		maxSize: maxSize,
 	}
 
 	return c, nil

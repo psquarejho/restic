@@ -12,7 +12,7 @@ import (
 func TestNewCache(t testing.TB) *Cache {
 	dir := test.TempDir(t)
 	t.Logf("created new cache at %v", dir)
-	cache, err := New(restic.NewRandomID().String(), dir)
+	cache, err := New(restic.NewRandomID().String(), dir, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -54,6 +54,55 @@ const TimeFormat = "2006-01-02 15:04:05"
 
 type backendWrapper func(r backend.Backend) (backend.Backend, error)
 
+// SizeFlag is a custom flag type for size values that supports suffixes (M, G, etc.)
+type SizeFlag int64
+
+func (s *SizeFlag) String() string {
+	if *s == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%d", *s)
+}
+
+func (s *SizeFlag) Type() string {
+	return "size"
+}
+
+func (s *SizeFlag) Set(value string) error {
+	if value == "" {
+		*s = 0
+		return nil
+	}
+
+	// Parse the number and suffix
+	var num float64
+	var suffix string
+	_, err := fmt.Sscanf(value, "%f%s", &num, &suffix)
+	if err != nil {
+		return fmt.Errorf("invalid size format: %v", err)
+	}
+
+	// Convert to bytes based on suffix
+	var bytes int64
+	switch strings.ToUpper(suffix) {
+	case "", "B":
+		bytes = int64(num)
+	case "K", "KB":
+		bytes = int64(num * 1024)
+	case "M", "MB":
+		bytes = int64(num * 1024 * 1024)
+	case "G", "GB":
+		bytes = int64(num * 1024 * 1024 * 1024)
+	case "T", "TB":
+		bytes = int64(num * 1024 * 1024 * 1024 * 1024)
+	default:
+		return fmt.Errorf("invalid size suffix: %s", suffix)
+	}
+
+	*s = SizeFlag(bytes)
+	return nil
+}
+
 // GlobalOptions hold all global options for restic.
 type GlobalOptions struct {
 	Repo               string
@@ -69,10 +118,12 @@ type GlobalOptions struct {
 	CacheDir           string
 	NoCache            bool
 	CleanupCache       bool
+	CacheMaxSize       SizeFlag
 	Compression        repository.CompressionMode
 	PackSize           uint
 	NoExtraVerify      bool
 	InsecureNoPassword bool
+	InsecureTLS        bool
 
 	backend.TransportOptions
 	limiter.Limits
@@ -94,6 +145,9 @@ type GlobalOptions struct {
 	Options []string
 
 	extended options.Options
+
+	RootCertFilenames        []string
+	TLSClientCertKeyFilename string
 }
 
 func (opts *GlobalOptions) AddFlags(f *pflag.FlagSet) {
@@ -115,6 +169,7 @@ func (opts *GlobalOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.InsecureNoPassword, "insecure-no-password", false, "use an empty password for the repository, must be passed to every restic command (insecure)")
 	f.BoolVar(&opts.InsecureTLS, "insecure-tls", false, "skip TLS certificate verification when connecting to the repository (insecure)")
 	f.BoolVar(&opts.CleanupCache, "cleanup-cache", false, "auto remove old cache directories")
+	f.Var(&opts.CacheMaxSize, "cache-max-size", "set the maximum `size` of the cache directory (with optional suffix: K, M, G, T). Examples: 500M, 2G, 1T")
 	f.Var(&opts.Compression, "compression", "compression mode (only available for repository format version 2), one of (auto|off|max) (default: $RESTIC_COMPRESSION)")
 	f.BoolVar(&opts.NoExtraVerify, "no-extra-verify", false, "skip additional verification of data before upload (see documentation)")
 	f.IntVar(&opts.Limits.UploadKb, "limit-upload", 0, "limits uploads to a maximum `rate` in KiB/s. (default: unlimited)")
@@ -539,7 +594,7 @@ func OpenRepository(ctx context.Context, opts GlobalOptions) (*repository.Reposi
 		return s, nil
 	}
 
-	c, err := cache.New(s.Config().ID, opts.CacheDir)
+	c, err := cache.New(s.Config().ID, opts.CacheDir, int64(opts.CacheMaxSize))
 	if err != nil {
 		Warnf("unable to open cache: %v\n", err)
 		return s, nil
