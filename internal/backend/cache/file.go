@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -91,17 +90,24 @@ func (c *Cache) save(h backend.Handle, rd io.Reader) error {
 		return errors.New("cannot be cached")
 	}
 
-	// If we have a size limit, create a buffer to check the file size
-	var buf *bytes.Buffer
-	var fileReader io.Reader = rd
-
+	// If we have a size limit, check the file size
 	if c.maxSize > 0 {
-		// We'll use this buffer to hold the file temporarily while we check the size
-		buf = &bytes.Buffer{}
+		// Create a temporary file to check its size
+		f, err := os.CreateTemp("", "restic-cache-size-check-")
+		if err != nil {
+			return errors.Wrap(err, "creating temporary file")
+		}
+		defer os.Remove(f.Name())
 
-		// Read the entire file into the buffer first
-		if _, err := io.Copy(buf, rd); err != nil {
-			return errors.Wrap(err, "reading file into buffer")
+		// Copy the reader to the temporary file
+		if _, err := io.Copy(f, rd); err != nil {
+			return errors.Wrap(err, "copying to temporary file")
+		}
+
+		// Get the file size
+		fi, err := f.Stat()
+		if err != nil {
+			return errors.Wrap(err, "stat temporary file")
 		}
 
 		// Check if adding this file would exceed the limit
@@ -110,7 +116,7 @@ func (c *Cache) save(h backend.Handle, rd io.Reader) error {
 			return errors.Wrap(err, "getTotalSize")
 		}
 
-		if totalSize+int64(buf.Len()) > c.maxSize {
+		if totalSize+fi.Size() > c.maxSize {
 			// Need to clean up old files
 			if err := c.enforceSizeLimit(); err != nil {
 				debug.Log("error enforcing size limit: %v", err)
@@ -118,8 +124,11 @@ func (c *Cache) save(h backend.Handle, rd io.Reader) error {
 			}
 		}
 
-		// Use the buffer as the reader for saving
-		fileReader = bytes.NewReader(buf.Bytes())
+		// Reset the file pointer to the beginning
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return errors.Wrap(err, "seeking temporary file")
+		}
+		rd = f
 	}
 
 	finalname := c.filename(h)
@@ -136,7 +145,7 @@ func (c *Cache) save(h backend.Handle, rd io.Reader) error {
 		return err
 	}
 
-	n, err := io.Copy(f, fileReader)
+	n, err := io.Copy(f, rd)
 	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(f.Name())
